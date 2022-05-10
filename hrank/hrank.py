@@ -9,6 +9,10 @@ import torch.backends.cudnn as cudnn
 import torchvision
 from torchvision import datasets, transforms
 
+#Comments
+#This file shows the code for Hrank method, which was discussed in "Section IV. TECHNIQUE FOR FINDING LAYER IMPORTANCE" in our DSC-2022 paper. 
+#Reference for this code is following paper: M. Lin et al., “Hrank: Filter pruning using high-rank feature map,” in CVPR, 2020, pp. 1529–1538.
+
 #from models.cifar10.vgg import vgg_16_bn
 #from models.cifar10.resnet import resnet_56,resnet_110
 #from models.cifar10.googlenet import googlenet
