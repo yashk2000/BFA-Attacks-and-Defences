@@ -2,12 +2,9 @@ import torch.nn as nn
 import torch.utils.model_zoo as model_zoo
 from .quantization import *
 
-__all__ = ['AlexNet', 'alexnet_quan']
-
 model_urls = {
     'alexnet': 'https://download.pytorch.org/models/alexnet-owt-4df8aa71.pth',
 }
-
 
 class AlexNet(nn.Module):
     def __init__(self, num_classes=1000):

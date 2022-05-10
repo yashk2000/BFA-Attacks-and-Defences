@@ -140,4 +140,3 @@ class quan_Linear(nn.Linear):
                                         self.half_lvls)
         # enable the flag, thus now computation does not invovle weight quantization
         self.inf_with_weight = True
-        

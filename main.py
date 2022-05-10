@@ -1,3 +1,4 @@
+
 from __future__ import division
 from __future__ import absolute_import
 
@@ -9,22 +10,21 @@ import torchvision.datasets as dset
 import torchvision.transforms as transforms
 from utils import AverageMeter, RecorderMeter, time_string, convert_secs2time, clustering_loss, change_quan_bitwidth
 from tensorboardX import SummaryWriter
-import models
+from models import alexnet_imagenet, densenet_imagenet, googlenet_imagenet, resnet_imagenet, shufflenet_imagenet, squeezenet_imagenet, vgg_imagenet, resnet_cifar, vanilla_resnet_cifar, mobilenet_imagenet
 from models.quantization import quan_Conv2d, quan_Linear, quantize
 
-from attack.BFA import *
+from defences.layer_freeze.layer_freeze import freeze_layers
+from attacks.litbfa.litbfa import attack_layers
+from attacks.bfa import BFA
+from attacks.random.rbfa import RBFA
 import torch.nn.functional as F
 import copy
+
+from attacks.utils.data_conversion import hamming_distance
 
 import pandas as pd
 import numpy as np
 
-model_names = sorted(name for name in models.__dict__
-                     if name.islower() and not name.startswith("__")
-                     and callable(models.__dict__[name]))
-
-################# Options ##################################################
-############################################################################
 parser = argparse.ArgumentParser(
     description='Training network for image classification',
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -40,10 +40,8 @@ parser.add_argument(
     help='Choose between Cifar10/100 and ImageNet.')
 parser.add_argument('--arch',
                     metavar='ARCH',
-                    default='lbcnn',
-                    choices=model_names,
-                    help='model architecture: ' + ' | '.join(model_names) +
-                    ' (default: resnext29_8_64)')
+                    default='resnet18',
+                    )
 # Optimization options
 parser.add_argument('--epochs',
                     type=int,
@@ -71,6 +69,10 @@ parser.add_argument('--schedule',
                     nargs='+',
                     default=[80, 120],
                     help='Decrease learning rate at these epochs.')
+parser.add_argument('--pretrained',
+                    type=bool,
+                    default=False,
+                    help='Load Pretrained model')
 parser.add_argument(
     '--gammas',
     type=float,
@@ -159,6 +161,14 @@ parser.add_argument('--random_bfa',
                     dest='random_bfa',
                     action='store_true',
                     help='perform the bit-flips randomly on weight bits')
+parser.add_argument('--litbfa',
+                    dest='litbfa',
+                    action='store_true',
+                    help='perform LI-T-BFA')
+parser.add_argument('--lfreeze',
+                    dest='lfreeze',
+                    action='store_true',
+                    help='perform the attack with layer freeze defence')
 
 # Piecewise clustering
 parser.add_argument('--clustering',
@@ -339,7 +349,25 @@ def main():
     print_log("=> creating model '{}'".format(args.arch), log)
 
     # Init model, criterion, and optimizer
-    net = models.__dict__[args.arch](num_classes)
+    if args.arch == 'alexnet':
+        net = alexnet_imagenet.alexnet_quan(args.pretrained, num_classes)
+    elif args.arch == 'googlenet':
+        net = googlenet_imagenet.googlenet_quan(args.pretrained, True, num_classes)
+    elif args.arch == 'mobilenet':
+        net = mobilenet_imagenet.mobilenet_v2_quan(args.pretrained, True, num_classes)
+    elif args.arch == 'resnet18':
+        net = resnet_imagenet.resnet18_quan(args.pretrained, True, num_classes)
+    elif args.arch == 'resnext50':
+        net = resnet_imagenet.resnext50_32x4d_quan(args.pretrained, True, num_classes)
+    elif args.arch == 'shufflenet':
+        net = shufflenet_imagenet.shufflenet_v2_x2_0(args.pretrained, True, num_classes)
+    elif args.arch == 'squeezenet':
+        net = squeezenet_imagenet.squeezenet1_1(args.pretrained, True, num_classes)
+    elif args.arch == 'vgg19':
+        net = vgg_imagenet.vgg19(args.pretrained, True, num_classes)
+    else:
+        print("Model not available")
+
     print_log("=> network :\n {}".format(net), log)
 
     if args.use_cuda:
@@ -436,15 +464,13 @@ def main():
                 # print(m.weight)
 
     attacker = BFA(criterion, net, args.k_top)
+    random_attacker = RBFA(criterion, net, args.k_top)
     net_clean = copy.deepcopy(net)
     # weight_conversion(net)
 
     if args.enable_bfa:
-        updated_model, lName, lIndex = perform_attack(attacker, net, net_clean, train_loader, test_loader,
-                       args.n_iter, log, writer, csv_save_path=args.save_path,
-                       random_attack=args.random_bfa)
-        final_model = train(train_loader, updated_model, criterion, optimizer, log)
-        validate(test_loader, final_model, criterion, log, summary_output=True)
+        perform_attack(attacker, random_attacker, net, net_clean, train_loader, test_loader, args.n_iter, log, writer, csv_save_path=args.save_path,
+        random_attack=args.random_bfa, litbfa=args.litbfa, lfreeze=args.lfreeze)
         return
 
     if args.evaluate:
@@ -551,17 +577,13 @@ def main():
     log.close()
 
 
-def perform_attack(attacker, model, model_clean, train_loader, test_loader,
-                   N_iter, log, writer, csv_save_path=None, random_attack=False):
+def perform_attack(attacker, random_attacker, model, model_clean, train_loader, test_loader, N_iter, log, writer, csv_save_path=None, random_attack=False, litbfa=False, lfreeze=False):
     # Note that, attack has to be done in evaluation model due to batch-norm.
     # see: https://discuss.pytorch.org/t/what-does-model-eval-do-for-batchnorm-layer/7146
     model.eval()
     losses = AverageMeter()
     iter_time = AverageMeter()
     attack_time = AverageMeter()
-
-    lName = []
-    lIndex = []
 
     # attempt to use the training data to conduct BFA
     for _, (data, target) in enumerate(train_loader):
@@ -590,16 +612,22 @@ def perform_attack(attacker, model, model_clean, train_loader, test_loader,
     
     df = pd.DataFrame() #init a empty dataframe for logging
     last_val_acc_top1 = val_acc_top1
+
+    if litbfa:
+        attacked_layers = attack_layers(os.path.join("hrank_jsons", str(args.arch) + ".json"), args.arch)
+    if lfreeze:
+        frozen_layers = freeze_layers(os.path.join("hrank_jsons", str(args.arch) + ".json"), args.arch)
     
     for i_iter in range(N_iter):
         print_log('**********************************', log)
-        if not random_attack:
-            attack_log, mName, mIndex = attacker.progressive_bit_search(model, data, target)
-            lName.append(mName)
-            lIndex.append(mIndex)
+        if random_attack:
+            attack_log = random_attacker.random_flip_one_bit(model)
+        elif litbfa:
+            attack_log = attacker.progressive_bit_search_litbfa(model, data, target, attacked_layers)
+        elif lfreeze:
+            attack_log = attacker.progressive_bit_search_lfreeze(model, data, target, frozen_layers)
         else:
-            attack_log = attacker.random_flip_one_bit(model)
-            
+            attack_log = attacker.progressive_bit_search(model, data, target)
         
         # measure data loading time
         attack_time.update(time.time() - end)
@@ -680,21 +708,12 @@ def perform_attack(attacker, model, model_clean, train_loader, test_loader,
     if csv_save_path is not None:
         csv_file_name = 'attack_profile_{}.csv'.format(args.manualSeed)
         export_csv = df.to_csv(os.path.join(csv_save_path, csv_file_name), index=None)
-      
-    return model, lName, lIndex
 
-def perform_defence(attacker, model, model_clean, train_loader, test_loader,
-                   N_iter, log, writer, lName, lIndex):    
-    uM = attacker.defence(model, lName, lIndex)    
-
-    val_acc_top1, val_acc_top5, val_loss, output_summary = validate(
-            test_loader, uM, attacker.criterion, log, summary_output=True)
-
-    return 
+    return
 
 
 # train function (forward, backward, update)
-def train(train_loader, model, criterion, optimizer, log):
+def train(train_loader, model, criterion, optimizer, epoch, log):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -736,24 +755,26 @@ def train(train_loader, model, criterion, optimizer, log):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        print_log(
-            '  Epoch: [{:03d}/{:03d}]   '
-            'Time {batch_time.val:.3f} ({batch_time.avg:.3f})   '
-            'Data {data_time.val:.3f} ({data_time.avg:.3f})   '
-            'Loss {loss.val:.4f} ({loss.avg:.4f})   '
-            'Prec@1 {top1.val:.3f} ({top1.avg:.3f})   '
-            'Prec@5 {top5.val:.3f} ({top5.avg:.3f})   '.format(
-                i,
-                len(train_loader),
-                batch_time=batch_time,
-                data_time=data_time,
-                loss=losses,
-                top1=top1,
-                top5=top5) + time_string(), log)
+        if i % args.print_freq == 0:
+            print_log(
+                '  Epoch: [{:03d}][{:03d}/{:03d}]   '
+                'Time {batch_time.val:.3f} ({batch_time.avg:.3f})   '
+                'Data {data_time.val:.3f} ({data_time.avg:.3f})   '
+                'Loss {loss.val:.4f} ({loss.avg:.4f})   '
+                'Prec@1 {top1.val:.3f} ({top1.avg:.3f})   '
+                'Prec@5 {top5.val:.3f} ({top5.avg:.3f})   '.format(
+                    epoch,
+                    i,
+                    len(train_loader),
+                    batch_time=batch_time,
+                    data_time=data_time,
+                    loss=losses,
+                    top1=top1,
+                    top5=top5) + time_string(), log)
     print_log(
         '  **Train** Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Error@1 {error1:.3f}'
         .format(top1=top1, top5=top5, error1=100 - top1.avg), log)
-    return model
+    return top1.avg, losses.avg
 
 
 def validate(val_loader, model, criterion, log, summary_output=False):
@@ -846,7 +867,7 @@ def accuracy(output, target, topk=(1, )):
         correct = pred.eq(target.view(1, -1).expand_as(pred))
         res = []
         for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0)
+            correct_k = correct[:k].view(-1).float().sum(0)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 

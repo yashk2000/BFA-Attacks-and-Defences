@@ -4,7 +4,7 @@ from models.quantization import quan_Conv2d, quan_Linear, quantize
 import operator
 from utils.data_conversion import int2bin, bin2int
 
-class BFA(object):
+class RBFA(object):
     def __init__(self, criterion, model, k_top=10):
 
         self.criterion = criterion
