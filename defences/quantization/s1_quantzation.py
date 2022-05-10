@@ -4,6 +4,7 @@ from torch.autograd import Variable
 from torchvision import models
 import torch.nn.functional as F
 
+#This file implements S1* quantization. If you want to implement S1 quantization, then just comment the lines shown below.
 
 class _quantize_func(torch.autograd.Function):
     @staticmethod
